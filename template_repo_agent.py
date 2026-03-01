@@ -1,37 +1,21 @@
 #!/usr/bin/env python3
-"""Interactive GitHub template repository bootstrapper.
-
-This script creates a template repository in a GitHub organization and
-initializes it with reusable GitHub Actions workflows based on user input.
-"""
+"""Local bootstrap wizard for repositories created from this GitHub template."""
 
 from __future__ import annotations
 
 import hashlib
 import json
-import os
 import re
 import shlex
 import subprocess
 import sys
-import tempfile
 from dataclasses import dataclass
 from datetime import datetime
-from getpass import getpass
 from pathlib import Path
 from textwrap import dedent
 from typing import Dict, List, Optional, Sequence, Set, Tuple
-from urllib.parse import quote
-
-try:
-    import requests
-except ImportError as exc:  # pragma: no cover
-    raise SystemExit(
-        "Missing dependency: requests. Install it with `pip install requests`."
-    ) from exc
 
 
-API_BASE = "https://api.github.com"
 ACTION_ORDER: List[Tuple[str, str]] = [
     ("release", "Release"),
     ("changelog", "Changelog"),
@@ -40,6 +24,8 @@ ACTION_ORDER: List[Tuple[str, str]] = [
 ]
 LANGUAGES = ["python", "javascript", "typescript", "go", "java", "rust", "generic"]
 BUMP_TYPES = ["auto", "patch", "minor", "major"]
+
+DEFAULT_LABELS = ["bug", "enhancement", "documentation"]
 
 KNOWN_LABEL_COLORS = {
     "bug": "d73a4a",
@@ -204,12 +190,18 @@ COMMON_GITIGNORE = dedent(
 
 
 @dataclass
+class RepositoryContext:
+    root: Path
+    default_owner: str
+    default_repo_name: str
+    remote_url: Optional[str]
+
+
+@dataclass
 class WizardConfig:
-    token: str
-    organization: str
     repository_name: str
     description: str
-    visibility: str
+    owner: str
     language: str
     labels: List[str]
     actions: Set[str]
@@ -217,93 +209,29 @@ class WizardConfig:
     release_bump_type: str
     lint_command: Optional[str]
     lint_install_command: Optional[str]
+    create_commit: bool
+    commit_message: str
+    cleanup: bool
+    source_url: Optional[str]
 
 
-class GitHubAPIError(RuntimeError):
-    """Raised when GitHub API returns a non-success response."""
-
-
-class GitHubClient:
-    def __init__(self, token: str) -> None:
-        self.session = requests.Session()
-        self.session.headers.update(
-            {
-                "Accept": "application/vnd.github+json",
-                "Authorization": f"Bearer {token}",
-                "X-GitHub-Api-Version": "2022-11-28",
-                "User-Agent": "template-repo-agent/1.0",
-            }
+def run_command(
+    command: Sequence[str], cwd: Path, check: bool = True
+) -> subprocess.CompletedProcess[str]:
+    process = subprocess.run(
+        command,
+        cwd=str(cwd),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    if check and process.returncode != 0:
+        cmd = " ".join(shlex.quote(part) for part in command)
+        raise RuntimeError(
+            f"Command failed ({cmd})\nstdout:\n{process.stdout}\nstderr:\n{process.stderr}"
         )
-
-    def create_org_repository(
-        self,
-        organization: str,
-        name: str,
-        description: str,
-        private: bool,
-        is_template: bool = True,
-    ) -> dict:
-        payload = {
-            "name": name,
-            "description": description,
-            "private": private,
-            "is_template": is_template,
-            "auto_init": False,
-        }
-        response = self.session.post(f"{API_BASE}/orgs/{organization}/repos", json=payload, timeout=30)
-        if response.status_code == 201:
-            return response.json()
-
-        if response.status_code == 422:
-            details = _extract_api_error(response)
-            if "name already exists" in details.lower() or "already exists" in details.lower():
-                raise GitHubAPIError(
-                    f"Repository '{organization}/{name}' already exists. Choose a different name."
-                )
-            raise GitHubAPIError(f"Validation failed while creating repository: {details}")
-
-        if response.status_code == 404:
-            raise GitHubAPIError(
-                f"Organization '{organization}' not found or token lacks permission to create repositories."
-            )
-
-        raise GitHubAPIError(
-            f"Failed to create repository (HTTP {response.status_code}): {_extract_api_error(response)}"
-        )
-
-    def create_label(self, organization: str, repository: str, name: str, color: str, description: str) -> None:
-        payload = {
-            "name": name,
-            "color": color,
-            "description": description,
-        }
-        response = self.session.post(
-            f"{API_BASE}/repos/{organization}/{repository}/labels",
-            json=payload,
-            timeout=30,
-        )
-        if response.status_code in (200, 201):
-            return
-        if response.status_code == 422:
-            # Duplicate label or invalid data.
-            message = _extract_api_error(response)
-            raise GitHubAPIError(f"Could not create label '{name}': {message}")
-        raise GitHubAPIError(
-            f"Failed to create label '{name}' (HTTP {response.status_code}): {_extract_api_error(response)}"
-        )
-
-
-def _extract_api_error(response: requests.Response) -> str:
-    try:
-        payload = response.json()
-    except ValueError:
-        return response.text.strip() or "Unknown API error"
-
-    message = payload.get("message", "Unknown API error")
-    errors = payload.get("errors")
-    if errors:
-        return f"{message} | details: {errors}"
-    return message
+    return process
 
 
 def prompt_required(prompt_text: str, validator=None) -> str:
@@ -351,17 +279,23 @@ def prompt_choice(prompt_text: str, choices: Sequence[str], default: str) -> str
         print(f"Invalid choice. Valid options: {', '.join(choices)}")
 
 
-def prompt_list(prompt_text: str) -> List[str]:
+def prompt_list(prompt_text: str, default_values: Sequence[str]) -> List[str]:
+    default_text = ", ".join(default_values)
     while True:
-        raw = input(prompt_text).strip()
-        values = [item.strip() for item in raw.split(",") if item.strip()]
+        raw = input(f"{prompt_text} [{default_text}]: ").strip()
+        if not raw:
+            values = list(default_values)
+        else:
+            values = [item.strip() for item in raw.split(",") if item.strip()]
+
         if values:
             seen = set()
             deduped = []
             for item in values:
-                if item.lower() not in seen:
+                lowered = item.lower()
+                if lowered not in seen:
                     deduped.append(item)
-                    seen.add(item.lower())
+                    seen.add(lowered)
             return deduped
         print("Please provide at least one value.")
 
@@ -409,47 +343,89 @@ def validate_repository_name(name: str) -> bool:
     return True
 
 
-def validate_organization(name: str) -> bool:
-    if not re.fullmatch(r"[A-Za-z0-9-]+", name):
-        print("Organization name may contain only letters, digits and '-'.")
+def parse_github_remote(remote_url: str) -> Tuple[Optional[str], Optional[str]]:
+    ssh_match = re.match(r"^git@github\.com:([^/]+)/([^/]+?)(?:\.git)?$", remote_url)
+    if ssh_match:
+        return ssh_match.group(1), ssh_match.group(2)
+
+    https_match = re.match(r"^https://github\.com/([^/]+)/([^/]+?)(?:\.git)?$", remote_url)
+    if https_match:
+        return https_match.group(1), https_match.group(2)
+
+    return None, None
+
+
+def is_git_repository(path: Path) -> bool:
+    try:
+        process = run_command(["git", "rev-parse", "--is-inside-work-tree"], path, check=False)
+    except (FileNotFoundError, RuntimeError):
         return False
-    return True
+    return process.returncode == 0 and process.stdout.strip() == "true"
 
 
-def run_wizard() -> WizardConfig:
-    print("GitHub Template Repository Setup Wizard")
-    print("=" * 40)
+def read_git_config(path: Path, key: str) -> Optional[str]:
+    try:
+        process = run_command(["git", "config", "--get", key], path, check=False)
+    except (FileNotFoundError, RuntimeError):
+        return None
+    if process.returncode != 0:
+        return None
+    value = process.stdout.strip()
+    return value if value else None
 
-    token = os.environ.get("GITHUB_TOKEN", "").strip()
-    if token:
-        print("Using token from GITHUB_TOKEN environment variable.")
-    else:
-        token = getpass("GitHub token (requires repo + org permissions): ").strip()
-        if not token:
-            raise SystemExit("GitHub token is required.")
 
-    default_org = os.environ.get("GITHUB_ORG", "")
-    if default_org:
-        organization = prompt_with_default("Organization", default_org, validate_organization)
-    else:
-        organization = prompt_required("Organization: ", validate_organization)
+def detect_repository_context(start_dir: Path) -> RepositoryContext:
+    root = start_dir
+    remote_url: Optional[str] = None
 
-    repository_name = prompt_required("Repository name: ", validate_repository_name)
-    description = prompt_with_default("Repository description", "GitHub automation template repository")
-    visibility = prompt_choice("Visibility (public/private)", ["public", "private"], "private")
+    if is_git_repository(start_dir):
+        top_level = run_command(["git", "rev-parse", "--show-toplevel"], start_dir, check=False)
+        if top_level.returncode == 0 and top_level.stdout.strip():
+            root = Path(top_level.stdout.strip())
+        remote_url = read_git_config(root, "remote.origin.url")
+
+    owner_from_remote: Optional[str] = None
+    repo_from_remote: Optional[str] = None
+    if remote_url:
+        owner_from_remote, repo_from_remote = parse_github_remote(remote_url)
+
+    default_owner = owner_from_remote or read_git_config(root, "user.name") or "Your Organization"
+    default_repo_name = repo_from_remote or root.name
+
+    return RepositoryContext(
+        root=root,
+        default_owner=default_owner,
+        default_repo_name=default_repo_name,
+        remote_url=remote_url,
+    )
+
+
+def run_wizard(context: RepositoryContext) -> WizardConfig:
+    print("Template Repository Local Setup Wizard")
+    print("=" * 42)
+    print("This setup runs locally in your repository (no GitHub API calls).\n")
+
+    repository_name = prompt_with_default(
+        "Repository name", context.default_repo_name, validate_repository_name
+    )
+    description = prompt_with_default("Repository description", f"{repository_name} project")
+    owner = prompt_with_default("Copyright owner", context.default_owner)
+
     language = prompt_choice(
         "Primary language (python/javascript/typescript/go/java/rust/generic)",
         LANGUAGES,
         "python",
     )
-
-    labels = prompt_list("Labels to create (comma-separated): ")
+    labels = prompt_list("Labels to configure (comma-separated)", DEFAULT_LABELS)
     actions = prompt_actions()
 
-    semantic_release_enabled = prompt_yes_no("Enable semantic-release for release automation?", True)
-    release_bump_type = prompt_choice(
-        "Default release bump type (auto/patch/minor/major)", BUMP_TYPES, "auto"
-    )
+    semantic_release_enabled = False
+    release_bump_type = "auto"
+    if "release" in actions:
+        semantic_release_enabled = prompt_yes_no("Enable semantic-release for release automation?", True)
+        release_bump_type = prompt_choice(
+            "Default release bump type (auto/patch/minor/major)", BUMP_TYPES, "auto"
+        )
 
     lint_command: Optional[str] = None
     lint_install_command: Optional[str] = None
@@ -467,12 +443,21 @@ def run_wizard() -> WizardConfig:
                 "Install command for lint dependencies (optional, leave blank to skip): "
             ).strip() or None
 
+    create_commit = False
+    commit_message = "chore: bootstrap repository from template"
+    if is_git_repository(context.root):
+        create_commit = prompt_yes_no("Create local git commit after setup?", True)
+        if create_commit:
+            commit_message = prompt_with_default("Commit message", commit_message)
+    else:
+        print("Git repository not detected. Skipping commit option.")
+
+    cleanup = prompt_yes_no("Delete setup script after successful setup?", True)
+
     return WizardConfig(
-        token=token,
-        organization=organization,
         repository_name=repository_name,
         description=description,
-        visibility=visibility,
+        owner=owner,
         language=language,
         labels=labels,
         actions=actions,
@@ -480,6 +465,10 @@ def run_wizard() -> WizardConfig:
         release_bump_type=release_bump_type,
         lint_command=lint_command,
         lint_install_command=lint_install_command,
+        create_commit=create_commit,
+        commit_message=commit_message,
+        cleanup=cleanup,
+        source_url=context.remote_url,
     )
 
 
@@ -501,7 +490,7 @@ def label_color(label: str) -> str:
     return hashlib.md5(normalized.encode("utf-8")).hexdigest()[:6]
 
 
-def build_readme(config: WizardConfig, repository_url: str) -> str:
+def build_readme(config: WizardConfig) -> str:
     actions_enabled = sorted(config.actions)
     action_labels = {
         "release": "Release workflow",
@@ -513,15 +502,16 @@ def build_readme(config: WizardConfig, repository_url: str) -> str:
     workflow_lines = [f"- {action_labels[action]}" for action in actions_enabled]
     workflow_block = "\n".join(workflow_lines) if workflow_lines else "- None"
 
-    semantic_block = "Disabled"
+    semantic_block = "Not enabled"
     if "release" in config.actions:
         semantic_block = (
             f"Enabled (default bump: {config.release_bump_type})"
             if config.semantic_release_enabled
-            else f"Disabled (manual workflow_dispatch release, default bump: {config.release_bump_type})"
+            else f"Manual release via workflow_dispatch (default bump: {config.release_bump_type})"
         )
 
     label_lines = "\n".join(f"- `{label}`" for label in config.labels)
+    source_url = config.source_url or "Set `origin` remote URL for this repository."
 
     return dedent(
         f"""\
@@ -529,10 +519,9 @@ def build_readme(config: WizardConfig, repository_url: str) -> str:
 
         {config.description}
 
-        ## Template Purpose
+        ## Repository Automation
 
-        This repository is configured as a GitHub Template Repository for quickly bootstrapping
-        projects with reusable automation workflows.
+        This repository was bootstrapped from a GitHub template with local setup.
 
         ## Enabled Workflows
 
@@ -540,7 +529,6 @@ def build_readme(config: WizardConfig, repository_url: str) -> str:
 
         ## Configuration Snapshot
 
-        - Visibility: `{config.visibility}`
         - Primary language: `{config.language}`
         - Semantic-release: {semantic_block}
 
@@ -548,27 +536,20 @@ def build_readme(config: WizardConfig, repository_url: str) -> str:
 
         {label_lines}
 
-        ## Usage
-
-        1. Click **Use this template** in GitHub.
-        2. Create a new repository from this template.
-        3. Adjust workflow settings in `.github/workflows/` as needed.
-
         ## Source Repository
 
-        {repository_url}
+        {source_url}
         """
     )
 
 
 def build_license(config: WizardConfig) -> str:
     year = datetime.now().year
-    owner = config.organization
     return dedent(
         f"""\
         MIT License
 
-        Copyright (c) {year} {owner}
+        Copyright (c) {year} {config.owner}
 
         Permission is hereby granted, free of charge, to any person obtaining a copy
         of this software and associated documentation files (the "Software"), to deal
@@ -892,9 +873,9 @@ def build_lint_workflow(config: WizardConfig) -> str:
     )
 
 
-def build_repository_files(config: WizardConfig, repository_url: str) -> Dict[str, str]:
+def build_repository_files(config: WizardConfig) -> Dict[str, str]:
     files: Dict[str, str] = {
-        "README.md": build_readme(config, repository_url),
+        "README.md": build_readme(config),
         "LICENSE": build_license(config),
         ".gitignore": build_gitignore(config.language),
         ".github/labels.json": json.dumps(
@@ -935,57 +916,44 @@ def write_files(base_dir: Path, files: Dict[str, str]) -> None:
         destination.write_text(content, encoding="utf-8")
 
 
-def run_command(command: Sequence[str], cwd: Path) -> str:
-    process = subprocess.run(
-        command,
-        cwd=str(cwd),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        check=False,
+def cleanup_setup_script(repo_root: Path) -> bool:
+    script_path = Path(__file__).resolve()
+    try:
+        script_path.relative_to(repo_root.resolve())
+    except ValueError:
+        return False
+
+    if not script_path.exists():
+        return False
+
+    try:
+        script_path.unlink()
+        return True
+    except OSError as exc:
+        print(f"Warning: Could not delete setup script '{script_path.name}': {exc}")
+        return False
+
+
+def create_local_commit(repo_root: Path, message: str) -> None:
+    if not is_git_repository(repo_root):
+        print("Git repository not detected; skipping commit.")
+        return
+
+    run_command(["git", "add", "-A"], repo_root)
+    commit = run_command(["git", "commit", "-m", message], repo_root, check=False)
+    output = f"{commit.stdout}\n{commit.stderr}".lower()
+    if commit.returncode == 0:
+        print("Created local commit with setup changes.")
+        return
+
+    if "nothing to commit" in output or "no changes added to commit" in output:
+        print("No local changes to commit.")
+        return
+
+    cmd = "git commit -m <message>"
+    raise RuntimeError(
+        f"Command failed ({cmd})\nstdout:\n{commit.stdout}\nstderr:\n{commit.stderr}"
     )
-    if process.returncode != 0:
-        cmd = " ".join(shlex.quote(part) for part in command)
-        raise RuntimeError(
-            f"Command failed ({cmd})\nstdout:\n{process.stdout}\nstderr:\n{process.stderr}"
-        )
-    return process.stdout.strip()
-
-
-def initialize_git_repository(temp_dir: Path, remote_url: str) -> None:
-    run_command(["git", "init"], temp_dir)
-
-    # Normalize main branch across older/newer git versions.
-    run_command(["git", "checkout", "-B", "main"], temp_dir)
-
-    run_command(["git", "config", "user.name", "template-repo-agent"], temp_dir)
-    run_command(
-        ["git", "config", "user.email", "template-repo-agent@users.noreply.github.com"],
-        temp_dir,
-    )
-
-    run_command(["git", "add", "."], temp_dir)
-    run_command(["git", "commit", "-m", "chore: initialize template repository"], temp_dir)
-    run_command(["git", "remote", "add", "origin", remote_url], temp_dir)
-    run_command(["git", "push", "-u", "origin", "main"], temp_dir)
-
-
-def create_labels(client: GitHubClient, config: WizardConfig) -> List[str]:
-    created = []
-    for label in config.labels:
-        try:
-            client.create_label(
-                organization=config.organization,
-                repository=config.repository_name,
-                name=label,
-                color=label_color(label),
-                description="Template label",
-            )
-            created.append(label)
-        except GitHubAPIError as exc:
-            # Continue with other labels; report all failures after attempt.
-            print(f"Warning: {exc}")
-    return created
 
 
 def workflow_summary(config: WizardConfig) -> List[str]:
@@ -1010,54 +978,38 @@ def workflow_summary(config: WizardConfig) -> List[str]:
 
 def main() -> int:
     try:
-        config = run_wizard()
-        client = GitHubClient(config.token)
+        context = detect_repository_context(Path.cwd())
+        config = run_wizard(context)
 
-        print("\nCreating repository...")
-        repository = client.create_org_repository(
-            organization=config.organization,
-            name=config.repository_name,
-            description=config.description,
-            private=config.visibility == "private",
-            is_template=True,
-        )
+        files = build_repository_files(config)
+        write_files(context.root, files)
 
-        html_url = repository["html_url"]
-        remote_url = (
-            f"https://x-access-token:{quote(config.token, safe='')}@github.com/"
-            f"{config.organization}/{config.repository_name}.git"
-        )
+        script_deleted = False
+        if config.cleanup:
+            script_deleted = cleanup_setup_script(context.root)
 
-        files = build_repository_files(config, html_url)
-        with tempfile.TemporaryDirectory(prefix="template-repo-agent-") as temp_path:
-            temp_dir = Path(temp_path)
-            write_files(temp_dir, files)
+        if config.create_commit:
+            create_local_commit(context.root, config.commit_message)
 
-            print("Creating initial commit and pushing files...")
-            initialize_git_repository(temp_dir, remote_url)
-
-        print("Creating labels...")
-        created_labels = create_labels(client, config)
-
-        print("\nRepository successfully created.")
-        print(f"URL: {html_url}")
+        print("\nRepository setup completed locally.")
         print("Enabled workflows/configuration:")
         for item in workflow_summary(config):
             print(f"- {item}")
 
-        if created_labels:
-            print("Created labels:")
-            for label in created_labels:
-                print(f"- {label}")
+        print("Configured labels manifest: .github/labels.json")
+        if script_deleted:
+            print("Cleanup: setup script deleted.")
+        elif config.cleanup:
+            print("Cleanup: setup script was not deleted automatically.")
         else:
-            print("No labels were created.")
+            print("Cleanup: setup script kept (as requested).")
 
         return 0
 
     except KeyboardInterrupt:
         print("\nOperation cancelled by user.")
         return 1
-    except (GitHubAPIError, RuntimeError, requests.RequestException) as exc:
+    except RuntimeError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
 

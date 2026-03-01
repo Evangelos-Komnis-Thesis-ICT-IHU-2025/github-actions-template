@@ -1,54 +1,43 @@
-# GitHub Template Repository Automation Agent
+# GitHub Template Repository Local Setup
 
-`template_repo_agent.py` is an interactive setup wizard that creates a GitHub **template repository** inside an organization and bootstraps it with configurable GitHub Actions workflows.
+`template_repo_agent.py` is an interactive wizard that runs **locally** inside a
+repository created via GitHub's **Use this template** button.
 
-## What it does
+## Workflow
+
+1. Create a new repository from this template in GitHub.
+2. Clone the new repository locally.
+3. Run the setup wizard locally.
+4. Keep only the generated project files (the setup script can auto-delete itself).
+
+## What it does locally
 
 - Prompts for setup options:
   - Repository name
   - Description
-  - Visibility (public/private)
+  - Copyright owner
   - Primary language
-  - Labels to create
+  - Labels to configure
   - Actions to enable (Release, Changelog, Lint, Labeler)
   - Semantic-release options (enable yes/no, default bump type)
   - Optional lint command overrides
-- Creates the repository via GitHub API with `is_template: true`
-- Generates and commits:
+- Generates repository files in place:
   - `README.md`
   - `LICENSE`
   - `.gitignore`
   - `.github/workflows/*.yml` (based on selected actions)
   - `.github/labeler-config.yml` (if Labeler enabled)
+  - `.github/labels.json`
   - `.releaserc.json` (if semantic-release enabled)
-- Pushes initial commit to `main`
-- Creates labels in the new repository via GitHub API
-- Prints the created repository URL and workflow summary
+- Optionally creates a local git commit with all setup changes.
+- Optionally removes `template_repo_agent.py` after setup.
 
 ## Requirements
 
 - Python 3.9+
 - `git` installed and available in `PATH`
-- Python package: `requests`
 
-Install dependency:
-
-```bash
-pip install requests
-```
-
-## Authentication
-
-Use a GitHub token with org repo creation permissions.
-
-Recommended environment variables:
-
-```bash
-export GITHUB_TOKEN=your_token_here
-export GITHUB_ORG=your_org_name
-```
-
-If `GITHUB_TOKEN` is not set, the script prompts for it securely.
+No GitHub token and no GitHub API permissions are required.
 
 ## Run
 
@@ -58,6 +47,6 @@ python3 template_repo_agent.py
 
 ## Notes
 
-- The generated lint workflow is language-aware through matrix/conditionals and can be overridden via wizard input.
-- Labeler rules are auto-generated from label names, using sensible defaults for common labels (`docs`, `tests`, `ci`, `dependencies`) and fallback path rules for custom labels.
-- If repository creation fails (for example duplicate name or permission issues), the script exits with a clear error message.
+- This setup is local-only; it does not create repositories or labels via GitHub API.
+- Labels are exported to `.github/labels.json` as a manifest for your own import/sync flow.
+- If your OS blocks deleting a running script, remove `template_repo_agent.py` manually after setup.
